@@ -17,28 +17,53 @@
 
 //! Integration tests for Iceberg Datafusion with Hive Metastore.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::error::Error;
 use std::sync::Arc;
 use std::vec;
 
-use datafusion::arrow::array::{Array, StringArray, UInt64Array};
-use datafusion::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
-use datafusion::execution::context::SessionContext;
+use datafusion::arrow::array::{Array, AsArray, RecordBatch, StringArray, UInt64Array};
+use datafusion::arrow::compute::{
+    cast, concat_batches, sort_to_indices, take_record_batch,
+};
+use datafusion::arrow::datatypes::{DataType, Field, Int64Type, Schema as ArrowSchema};
+use datafusion::arrow::util::pretty::pretty_format_batches;
+use datafusion::datasource::TableProvider;
+use datafusion::datasource::source::DataSourceExec;
+use datafusion::execution::context::{SessionConfig, SessionContext};
 use datafusion::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
-use datafusion_iceberg::IcebergCatalogProvider;
-use expect_test::expect;
+use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
+use datafusion::physical_plan::common::collect;
 use iceberg::io::LocalFsStorageFactory;
 use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
 use iceberg::spec::{
-    NestedField, PrimitiveType, Schema, StructType, Transform, Type, UnboundPartitionSpec,
+    Literal, NestedField, PrimitiveType, Schema, Struct, StructType, Transform, Type,
+    UnboundPartitionField, UnboundPartitionSpec,
 };
-use iceberg::test_utils::check_record_batches;
+use iceberg::transaction::{AddColumn, ApplyTransactionAction, Transaction};
 use iceberg::{
     Catalog, CatalogBuilder, MemoryCatalog, NamespaceIdent, Result as IcebergResult,
     TableCreation, TableIdent,
 };
+use iceberg_datafusion::metadata::{
+    IcebergMetadataDataSource, IcebergMetadataTableProvider,
+};
+use iceberg_datafusion::read::IcebergDataSource;
+use iceberg_datafusion::write::{IcebergCommitExec, IcebergWriteExec};
+use iceberg_datafusion::{
+    IcebergCatalogProvider, IcebergCatalogTableProvider, IcebergStaticTableProvider,
+};
 use tempfile::TempDir;
+
+fn display_schema(schema: &ArrowSchema) -> String {
+    schema
+        .fields()
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
 
 fn temp_path() -> String {
     let temp_dir = TempDir::new().unwrap();
@@ -175,15 +200,14 @@ async fn test_provider_list_table_names() -> Result<(), Box<dyn Error>> {
 
     let result = schema.table_names();
 
-    expect![[r#"
+    insta::assert_debug_snapshot!(&result, @r#"
         [
             "my_table",
             "my_table$snapshots",
             "my_table$manifests",
             "my_table$history",
         ]
-    "#]]
-    .assert_debug_eq(&result);
+    "#);
 
     Ok(())
 }
@@ -255,7 +279,10 @@ async fn test_table_projection() -> Result<(), Box<dyn Error>> {
         .unwrap();
     assert_eq!(2, s.len());
     // the first row is logical_plan, the second row is physical_plan
-    assert!(s.value(1).contains("projection:[foo1,foo2,foo3]"));
+    assert!(
+        s.value(1)
+            .contains("DataSourceExec: format=iceberg, projection=[foo1, foo2, foo3]")
+    );
 
     // datafusion doesn't support query foo3.s_foo1, use foo3 instead
     let records = table_df
@@ -276,7 +303,7 @@ async fn test_table_projection() -> Result<(), Box<dyn Error>> {
     assert_eq!(2, s.len());
     assert!(
         s.value(1)
-            .contains("IcebergTableScan projection:[foo1,foo3]")
+            .contains("DataSourceExec: format=iceberg, projection=[foo1, foo3]")
     );
 
     Ok(())
@@ -323,7 +350,7 @@ async fn test_table_predict_pushdown() -> Result<(), Box<dyn Error>> {
         .unwrap();
     assert_eq!(2, s.len());
     // the first row is logical_plan, the second row is physical_plan
-    let expected = "predicate:[(foo > 1) OR (bar IS NULL)]";
+    let expected = "predicate=(foo > 1) OR (bar IS NULL)";
     assert!(s.value(1).trim().contains(expected));
     Ok(())
 }
@@ -357,37 +384,15 @@ async fn test_metadata_table() -> Result<(), Box<dyn Error>> {
         .collect()
         .await
         .unwrap();
-    check_record_batches(
-        snapshots,
-        expect![[r#"
-            Field { "committed_at": Timestamp(µs, "+00:00"), metadata: {"PARQUET:field_id": "1"} },
-            Field { "snapshot_id": Int64, metadata: {"PARQUET:field_id": "2"} },
-            Field { "parent_id": nullable Int64, metadata: {"PARQUET:field_id": "3"} },
-            Field { "operation": nullable Utf8, metadata: {"PARQUET:field_id": "4"} },
-            Field { "manifest_list": nullable Utf8, metadata: {"PARQUET:field_id": "5"} },
-            Field { "summary": nullable Map("key_value": non-null Struct("key": non-null Utf8, metadata: {"PARQUET:field_id": "7"}, "value": Utf8, metadata: {"PARQUET:field_id": "8"}), unsorted), metadata: {"PARQUET:field_id": "6"} }"#]],
-        expect![[r#"
-            committed_at: PrimitiveArray<Timestamp(µs, "+00:00")>
-            [
-            ],
-            snapshot_id: PrimitiveArray<Int64>
-            [
-            ],
-            parent_id: PrimitiveArray<Int64>
-            [
-            ],
-            operation: StringArray
-            [
-            ],
-            manifest_list: StringArray
-            [
-            ],
-            summary: MapArray
-            [
-            ]"#]],
-        &[],
-        None,
-    );
+    insta::assert_snapshot!(display_schema(&snapshots[0].schema()), @r#"
+    Field { "committed_at": Timestamp(µs, "+00:00"), metadata: {"PARQUET:field_id": "1"} }
+    Field { "snapshot_id": Int64, metadata: {"PARQUET:field_id": "2"} }
+    Field { "parent_id": nullable Int64, metadata: {"PARQUET:field_id": "3"} }
+    Field { "operation": nullable Utf8, metadata: {"PARQUET:field_id": "4"} }
+    Field { "manifest_list": nullable Utf8, metadata: {"PARQUET:field_id": "5"} }
+    Field { "summary": nullable Map("key_value": non-null Struct("key": non-null Utf8, metadata: {"PARQUET:field_id": "7"}, "value": Utf8, metadata: {"PARQUET:field_id": "8"}), unsorted), metadata: {"PARQUET:field_id": "6"} }
+    "#);
+    assert!(snapshots.iter().all(|batch| batch.num_rows() == 0));
 
     let manifests = ctx
         .sql("select * from catalog.ns.t1$manifests")
@@ -396,61 +401,21 @@ async fn test_metadata_table() -> Result<(), Box<dyn Error>> {
         .collect()
         .await
         .unwrap();
-    check_record_batches(
-        manifests,
-        expect![[r#"
-            Field { "content": Int32, metadata: {"PARQUET:field_id": "14"} },
-            Field { "path": Utf8, metadata: {"PARQUET:field_id": "1"} },
-            Field { "length": Int64, metadata: {"PARQUET:field_id": "2"} },
-            Field { "partition_spec_id": Int32, metadata: {"PARQUET:field_id": "3"} },
-            Field { "added_snapshot_id": Int64, metadata: {"PARQUET:field_id": "4"} },
-            Field { "added_data_files_count": Int32, metadata: {"PARQUET:field_id": "5"} },
-            Field { "existing_data_files_count": Int32, metadata: {"PARQUET:field_id": "6"} },
-            Field { "deleted_data_files_count": Int32, metadata: {"PARQUET:field_id": "7"} },
-            Field { "added_delete_files_count": Int32, metadata: {"PARQUET:field_id": "15"} },
-            Field { "existing_delete_files_count": Int32, metadata: {"PARQUET:field_id": "16"} },
-            Field { "deleted_delete_files_count": Int32, metadata: {"PARQUET:field_id": "17"} },
-            Field { "partition_summaries": List(non-null Struct("contains_null": non-null Boolean, metadata: {"PARQUET:field_id": "10"}, "contains_nan": Boolean, metadata: {"PARQUET:field_id": "11"}, "lower_bound": Utf8, metadata: {"PARQUET:field_id": "12"}, "upper_bound": Utf8, metadata: {"PARQUET:field_id": "13"}), metadata: {"PARQUET:field_id": "9"}), metadata: {"PARQUET:field_id": "8"} }"#]],
-        expect![[r#"
-            content: PrimitiveArray<Int32>
-            [
-            ],
-            path: StringArray
-            [
-            ],
-            length: PrimitiveArray<Int64>
-            [
-            ],
-            partition_spec_id: PrimitiveArray<Int32>
-            [
-            ],
-            added_snapshot_id: PrimitiveArray<Int64>
-            [
-            ],
-            added_data_files_count: PrimitiveArray<Int32>
-            [
-            ],
-            existing_data_files_count: PrimitiveArray<Int32>
-            [
-            ],
-            deleted_data_files_count: PrimitiveArray<Int32>
-            [
-            ],
-            added_delete_files_count: PrimitiveArray<Int32>
-            [
-            ],
-            existing_delete_files_count: PrimitiveArray<Int32>
-            [
-            ],
-            deleted_delete_files_count: PrimitiveArray<Int32>
-            [
-            ],
-            partition_summaries: ListArray
-            [
-            ]"#]],
-        &[],
-        None,
-    );
+    insta::assert_snapshot!(display_schema(&manifests[0].schema()), @r#"
+    Field { "content": Int32, metadata: {"PARQUET:field_id": "14"} }
+    Field { "path": Utf8, metadata: {"PARQUET:field_id": "1"} }
+    Field { "length": Int64, metadata: {"PARQUET:field_id": "2"} }
+    Field { "partition_spec_id": Int32, metadata: {"PARQUET:field_id": "3"} }
+    Field { "added_snapshot_id": Int64, metadata: {"PARQUET:field_id": "4"} }
+    Field { "added_data_files_count": Int32, metadata: {"PARQUET:field_id": "5"} }
+    Field { "existing_data_files_count": Int32, metadata: {"PARQUET:field_id": "6"} }
+    Field { "deleted_data_files_count": Int32, metadata: {"PARQUET:field_id": "7"} }
+    Field { "added_delete_files_count": Int32, metadata: {"PARQUET:field_id": "15"} }
+    Field { "existing_delete_files_count": Int32, metadata: {"PARQUET:field_id": "16"} }
+    Field { "deleted_delete_files_count": Int32, metadata: {"PARQUET:field_id": "17"} }
+    Field { "partition_summaries": List(non-null Struct("contains_null": non-null Boolean, metadata: {"PARQUET:field_id": "10"}, "contains_nan": Boolean, metadata: {"PARQUET:field_id": "11"}, "lower_bound": Utf8, metadata: {"PARQUET:field_id": "12"}, "upper_bound": Utf8, metadata: {"PARQUET:field_id": "13"}), metadata: {"PARQUET:field_id": "9"}), metadata: {"PARQUET:field_id": "8"} }
+    "#);
+    assert!(manifests.iter().all(|batch| batch.num_rows() == 0));
 
     Ok(())
 }
@@ -507,32 +472,25 @@ async fn test_insert_into() -> Result<(), Box<dyn Error>> {
 
     // Query the table to verify the inserted data
     let df = ctx
-        .sql("SELECT * FROM catalog.test_insert_into.my_table")
+        .sql("SELECT * FROM catalog.test_insert_into.my_table ORDER BY foo1")
         .await
         .unwrap();
 
     let batches = df.collect().await.unwrap();
 
-    // Use check_record_batches to verify the data
-    check_record_batches(
-        batches,
-        expect![[r#"
-            Field { "foo1": Int32, metadata: {"PARQUET:field_id": "1"} },
-            Field { "foo2": Utf8, metadata: {"PARQUET:field_id": "2"} }"#]],
-        expect![[r#"
-            foo1: PrimitiveArray<Int32>
-            [
-              1,
-              2,
-            ],
-            foo2: StringArray
-            [
-              "alan",
-              "turing",
-            ]"#]],
-        &[],
-        Some("foo1"),
-    );
+    // Verify the data
+    insta::assert_snapshot!(display_schema(&batches[0].schema()), @r#"
+    Field { "foo1": Int32, metadata: {"PARQUET:field_id": "1"} }
+    Field { "foo2": Utf8, metadata: {"PARQUET:field_id": "2"} }
+    "#);
+    insta::assert_snapshot!(pretty_format_batches(&batches)?.to_string(), @r"
+    +------+--------+
+    | foo1 | foo2   |
+    +------+--------+
+    | 1    | alan   |
+    | 2    | turing |
+    +------+--------+
+    ");
 
     Ok(())
 }
@@ -630,8 +588,8 @@ async fn test_insert_into_nested() -> Result<(), Box<dyn Error>> {
     // Insert data with nested structs
     let insert_sql = r#"
     INSERT INTO catalog.test_insert_nested.nested_table
-    SELECT 
-        1 as id, 
+    SELECT
+        1 as id,
         'Alice' as name,
         named_struct(
             'address', named_struct(
@@ -645,8 +603,8 @@ async fn test_insert_into_nested() -> Result<(), Box<dyn Error>> {
             )
         ) as profile
     UNION ALL
-    SELECT 
-        2 as id, 
+    SELECT
+        2 as id,
         'Bob' as name,
         named_struct(
             'address', named_struct(
@@ -686,97 +644,34 @@ async fn test_insert_into_nested() -> Result<(), Box<dyn Error>> {
 
     let batches = df.collect().await.unwrap();
 
-    // Use check_record_batches to verify the data
-    check_record_batches(
-        batches,
-        expect![[r#"
-            Field { "id": Int32, metadata: {"PARQUET:field_id": "1"} },
-            Field { "name": Utf8, metadata: {"PARQUET:field_id": "2"} },
-            Field { "profile": nullable Struct("address": Struct("street": Utf8, metadata: {"PARQUET:field_id": "6"}, "city": Utf8, metadata: {"PARQUET:field_id": "7"}, "zip": Int32, metadata: {"PARQUET:field_id": "8"}), metadata: {"PARQUET:field_id": "4"}, "contact": Struct("email": Utf8, metadata: {"PARQUET:field_id": "9"}, "phone": Utf8, metadata: {"PARQUET:field_id": "10"}), metadata: {"PARQUET:field_id": "5"}), metadata: {"PARQUET:field_id": "3"} }"#]],
-        expect![[r#"
-            id: PrimitiveArray<Int32>
-            [
-              1,
-              2,
-            ],
-            name: StringArray
-            [
-              "Alice",
-              "Bob",
-            ],
-            profile: StructArray
-            -- validity:
-            [
-              valid,
-              valid,
-            ]
-            [
-            -- child 0: "address" (Struct([Field { name: "street", data_type: Utf8, nullable: true, metadata: {"PARQUET:field_id": "6"} }, Field { name: "city", data_type: Utf8, nullable: true, metadata: {"PARQUET:field_id": "7"} }, Field { name: "zip", data_type: Int32, nullable: true, metadata: {"PARQUET:field_id": "8"} }]))
-            StructArray
-            -- validity:
-            [
-              valid,
-              valid,
-            ]
-            [
-            -- child 0: "street" (Utf8)
-            StringArray
-            [
-              "123 Main St",
-              "456 Market St",
-            ]
-            -- child 1: "city" (Utf8)
-            StringArray
-            [
-              "San Francisco",
-              "San Jose",
-            ]
-            -- child 2: "zip" (Int32)
-            PrimitiveArray<Int32>
-            [
-              94105,
-              95113,
-            ]
-            ]
-            -- child 1: "contact" (Struct([Field { name: "email", data_type: Utf8, nullable: true, metadata: {"PARQUET:field_id": "9"} }, Field { name: "phone", data_type: Utf8, nullable: true, metadata: {"PARQUET:field_id": "10"} }]))
-            StructArray
-            -- validity:
-            [
-              valid,
-              valid,
-            ]
-            [
-            -- child 0: "email" (Utf8)
-            StringArray
-            [
-              "alice@example.com",
-              "bob@example.com",
-            ]
-            -- child 1: "phone" (Utf8)
-            StringArray
-            [
-              "555-1234",
-              null,
-            ]
-            ]
-            ]"#]],
-        &[],
-        Some("id"),
-    );
+    // Verify the data
+    insta::assert_snapshot!(display_schema(&batches[0].schema()), @r#"
+    Field { "id": Int32, metadata: {"PARQUET:field_id": "1"} }
+    Field { "name": Utf8, metadata: {"PARQUET:field_id": "2"} }
+    Field { "profile": nullable Struct("address": Struct("street": Utf8, metadata: {"PARQUET:field_id": "6"}, "city": Utf8, metadata: {"PARQUET:field_id": "7"}, "zip": Int32, metadata: {"PARQUET:field_id": "8"}), metadata: {"PARQUET:field_id": "4"}, "contact": Struct("email": Utf8, metadata: {"PARQUET:field_id": "9"}, "phone": Utf8, metadata: {"PARQUET:field_id": "10"}), metadata: {"PARQUET:field_id": "5"}), metadata: {"PARQUET:field_id": "3"} }
+    "#);
+    insta::assert_snapshot!(pretty_format_batches(&batches)?.to_string(), @r"
+    +----+-------+-------------------------------------------------------------------------------------------------------------------------+
+    | id | name  | profile                                                                                                                 |
+    +----+-------+-------------------------------------------------------------------------------------------------------------------------+
+    | 1  | Alice | {address: {street: 123 Main St, city: San Francisco, zip: 94105}, contact: {email: alice@example.com, phone: 555-1234}} |
+    | 2  | Bob   | {address: {street: 456 Market St, city: San Jose, zip: 95113}, contact: {email: bob@example.com, phone: }}              |
+    +----+-------+-------------------------------------------------------------------------------------------------------------------------+
+    ");
 
     // Query with explicit field access to verify nested data
     let df = ctx
         .sql(
             r#"
-            SELECT 
-                id, 
+            SELECT
+                id,
                 name,
                 profile.address.street,
                 profile.address.city,
                 profile.address.zip,
                 profile.contact.email,
                 profile.contact.phone
-            FROM catalog.test_insert_nested.nested_table 
+            FROM catalog.test_insert_nested.nested_table
             ORDER BY id
         "#,
         )
@@ -785,56 +680,24 @@ async fn test_insert_into_nested() -> Result<(), Box<dyn Error>> {
 
     let batches = df.collect().await.unwrap();
 
-    // Use check_record_batches to verify the flattened data
-    check_record_batches(
-        batches,
-        expect![[r#"
-            Field { "id": Int32, metadata: {"PARQUET:field_id": "1"} },
-            Field { "name": Utf8, metadata: {"PARQUET:field_id": "2"} },
-            Field { "catalog.test_insert_nested.nested_table.profile[address][street]": nullable Utf8, metadata: {"PARQUET:field_id": "6"} },
-            Field { "catalog.test_insert_nested.nested_table.profile[address][city]": nullable Utf8, metadata: {"PARQUET:field_id": "7"} },
-            Field { "catalog.test_insert_nested.nested_table.profile[address][zip]": nullable Int32, metadata: {"PARQUET:field_id": "8"} },
-            Field { "catalog.test_insert_nested.nested_table.profile[contact][email]": nullable Utf8, metadata: {"PARQUET:field_id": "9"} },
-            Field { "catalog.test_insert_nested.nested_table.profile[contact][phone]": nullable Utf8, metadata: {"PARQUET:field_id": "10"} }"#]],
-        expect![[r#"
-            id: PrimitiveArray<Int32>
-            [
-              1,
-              2,
-            ],
-            name: StringArray
-            [
-              "Alice",
-              "Bob",
-            ],
-            catalog.test_insert_nested.nested_table.profile[address][street]: StringArray
-            [
-              "123 Main St",
-              "456 Market St",
-            ],
-            catalog.test_insert_nested.nested_table.profile[address][city]: StringArray
-            [
-              "San Francisco",
-              "San Jose",
-            ],
-            catalog.test_insert_nested.nested_table.profile[address][zip]: PrimitiveArray<Int32>
-            [
-              94105,
-              95113,
-            ],
-            catalog.test_insert_nested.nested_table.profile[contact][email]: StringArray
-            [
-              "alice@example.com",
-              "bob@example.com",
-            ],
-            catalog.test_insert_nested.nested_table.profile[contact][phone]: StringArray
-            [
-              "555-1234",
-              null,
-            ]"#]],
-        &[],
-        Some("id"),
-    );
+    // Verify the flattened data
+    insta::assert_snapshot!(display_schema(&batches[0].schema()), @r#"
+    Field { "id": Int32, metadata: {"PARQUET:field_id": "1"} }
+    Field { "name": Utf8, metadata: {"PARQUET:field_id": "2"} }
+    Field { "catalog.test_insert_nested.nested_table.profile[address][street]": nullable Utf8, metadata: {"PARQUET:field_id": "6"} }
+    Field { "catalog.test_insert_nested.nested_table.profile[address][city]": nullable Utf8, metadata: {"PARQUET:field_id": "7"} }
+    Field { "catalog.test_insert_nested.nested_table.profile[address][zip]": nullable Int32, metadata: {"PARQUET:field_id": "8"} }
+    Field { "catalog.test_insert_nested.nested_table.profile[contact][email]": nullable Utf8, metadata: {"PARQUET:field_id": "9"} }
+    Field { "catalog.test_insert_nested.nested_table.profile[contact][phone]": nullable Utf8, metadata: {"PARQUET:field_id": "10"} }
+    "#);
+    insta::assert_snapshot!(pretty_format_batches(&batches)?.to_string(), @r"
+    +----+-------+------------------------------------------------------------------+----------------------------------------------------------------+---------------------------------------------------------------+-----------------------------------------------------------------+-----------------------------------------------------------------+
+    | id | name  | catalog.test_insert_nested.nested_table.profile[address][street] | catalog.test_insert_nested.nested_table.profile[address][city] | catalog.test_insert_nested.nested_table.profile[address][zip] | catalog.test_insert_nested.nested_table.profile[contact][email] | catalog.test_insert_nested.nested_table.profile[contact][phone] |
+    +----+-------+------------------------------------------------------------------+----------------------------------------------------------------+---------------------------------------------------------------+-----------------------------------------------------------------+-----------------------------------------------------------------+
+    | 1  | Alice | 123 Main St                                                      | San Francisco                                                  | 94105                                                         | alice@example.com                                               | 555-1234                                                        |
+    | 2  | Bob   | 456 Market St                                                    | San Jose                                                       | 95113                                                         | bob@example.com                                                 |                                                                 |
+    +----+-------+------------------------------------------------------------------+----------------------------------------------------------------+---------------------------------------------------------------+-----------------------------------------------------------------+-----------------------------------------------------------------+
+    ");
 
     Ok(())
 }
@@ -845,7 +708,7 @@ async fn test_insert_into_partitioned() -> Result<(), Box<dyn Error>> {
     let namespace = NamespaceIdent::new("test_partitioned_write".to_string());
     set_test_namespace(&iceberg_catalog, &namespace).await?;
 
-    // Create a schema with a partition column
+    // Create a schema with string and nullable float/double partition columns
     let schema = Schema::builder()
         .with_schema_id(0)
         .with_fields(vec![
@@ -854,13 +717,45 @@ async fn test_insert_into_partitioned() -> Result<(), Box<dyn Error>> {
                 .into(),
             NestedField::required(3, "value", Type::Primitive(PrimitiveType::String))
                 .into(),
+            NestedField::optional(
+                4,
+                "float_partition",
+                Type::Primitive(PrimitiveType::Float),
+            )
+            .into(),
+            NestedField::optional(
+                5,
+                "double_partition",
+                Type::Primitive(PrimitiveType::Double),
+            )
+            .into(),
         ])
         .build()?;
 
-    // Create partition spec with identity transform on category
+    // Identity-partition on category and both floating-point values
     let partition_spec = UnboundPartitionSpec::builder()
         .with_spec_id(0)
-        .add_partition_field(2, "category", Transform::Identity)?
+        .add_partition_field(
+            UnboundPartitionField::builder()
+                .source_ids(vec![2])
+                .name("category")
+                .transform(Transform::Identity)
+                .build()?,
+        )?
+        .add_partition_field(
+            UnboundPartitionField::builder()
+                .source_ids(vec![4])
+                .name("float_partition")
+                .transform(Transform::Identity)
+                .build()?,
+        )?
+        .add_partition_field(
+            UnboundPartitionField::builder()
+                .source_ids(vec![5])
+                .name("double_partition")
+                .transform(Transform::Identity)
+                .build()?,
+        )?
         .build();
 
     // Create the partitioned table
@@ -877,20 +772,23 @@ async fn test_insert_into_partitioned() -> Result<(), Box<dyn Error>> {
     let client = Arc::new(iceberg_catalog);
     let catalog = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
 
-    let ctx = SessionContext::new();
+    // One task must return all five partition files in the same Avro payload.
+    let ctx =
+        SessionContext::new_with_config(SessionConfig::new().with_target_partitions(1));
     ctx.register_catalog("catalog", catalog);
 
     // Insert data with multiple partition values in a single batch
     let df = ctx
         .sql(
             r#"
-            INSERT INTO catalog.test_partitioned_write.partitioned_table 
-            VALUES 
-                (1, 'electronics', 'laptop'),
-                (2, 'electronics', 'phone'),
-                (3, 'books', 'novel'),
-                (4, 'books', 'textbook'),
-                (5, 'clothing', 'shirt')
+            INSERT INTO catalog.test_partitioned_write.partitioned_table
+            VALUES
+                (1, 'electronics', 'laptop', CAST(123.456 AS REAL), CAST(123.456 AS DOUBLE)),
+                (2, 'electronics', 'phone', CAST(123.456 AS REAL), CAST(123.456 AS DOUBLE)),
+                (3, 'books', 'novel', CAST('NaN' AS REAL), CAST('NaN' AS DOUBLE)),
+                (4, 'books', 'textbook', CAST('Infinity' AS REAL), CAST('Infinity' AS DOUBLE)),
+                (5, 'clothing', 'shirt', CAST('-Infinity' AS REAL), CAST('-Infinity' AS DOUBLE)),
+                (6, 'clothing', 'coat', CAST(NULL AS REAL), CAST(NULL AS DOUBLE))
             "#,
         )
         .await
@@ -904,9 +802,9 @@ async fn test_insert_into_partitioned() -> Result<(), Box<dyn Error>> {
         .as_any()
         .downcast_ref::<UInt64Array>()
         .unwrap();
-    assert_eq!(rows_inserted.value(0), 5);
+    assert_eq!(rows_inserted.value(0), 6);
 
-    // Query the table to verify data
+    // Read all rows without a filter, including NaN, infinities, and null.
     let df = ctx
         .sql("SELECT * FROM catalog.test_partitioned_write.partitioned_table ORDER BY id")
         .await
@@ -915,44 +813,63 @@ async fn test_insert_into_partitioned() -> Result<(), Box<dyn Error>> {
     let batches = df.collect().await.unwrap();
 
     // Verify the data - note that _partition column should NOT be present
-    check_record_batches(
-        batches,
-        expect![[r#"
-            Field { "id": Int32, metadata: {"PARQUET:field_id": "1"} },
-            Field { "category": Utf8, metadata: {"PARQUET:field_id": "2"} },
-            Field { "value": Utf8, metadata: {"PARQUET:field_id": "3"} }"#]],
-        expect![[r#"
-            id: PrimitiveArray<Int32>
-            [
-              1,
-              2,
-              3,
-              4,
-              5,
-            ],
-            category: StringArray
-            [
-              "electronics",
-              "electronics",
-              "books",
-              "books",
-              "clothing",
-            ],
-            value: StringArray
-            [
-              "laptop",
-              "phone",
-              "novel",
-              "textbook",
-              "shirt",
-            ]"#]],
-        &[],
-        Some("id"),
-    );
+    insta::assert_snapshot!(display_schema(&batches[0].schema()), @r#"
+    Field { "id": Int32, metadata: {"PARQUET:field_id": "1"} }
+    Field { "category": Utf8, metadata: {"PARQUET:field_id": "2"} }
+    Field { "value": Utf8, metadata: {"PARQUET:field_id": "3"} }
+    Field { "float_partition": nullable Float32, metadata: {"PARQUET:field_id": "4"} }
+    Field { "double_partition": nullable Float64, metadata: {"PARQUET:field_id": "5"} }
+    "#);
+    insta::assert_snapshot!(pretty_format_batches(&batches)?.to_string(), @r"
+    +----+-------------+----------+-----------------+------------------+
+    | id | category    | value    | float_partition | double_partition |
+    +----+-------------+----------+-----------------+------------------+
+    | 1  | electronics | laptop   | 123.456         | 123.456          |
+    | 2  | electronics | phone    | 123.456         | 123.456          |
+    | 3  | books       | novel    | NaN             | NaN              |
+    | 4  | books       | textbook | inf             | inf              |
+    | 5  | clothing    | shirt    | -inf            | -inf             |
+    | 6  | clothing    | coat     |                 |                  |
+    +----+-------------+----------+-----------------+------------------+
+    ");
 
-    // Verify that data files exist under correct partition paths
+    // Verify the committed files, rows, and partition values.
     let table_ident = TableIdent::new(namespace.clone(), "partitioned_table".to_string());
     let table = client.load_table(&table_ident).await?;
+
+    let snapshot = table.metadata().current_snapshot().unwrap();
+    let manifest_list = table.manifest_list_reader(snapshot).load().await?;
+    let mut file_count = 0;
+    let mut row_count = 0;
+    let mut partitions = HashSet::new();
+    for entry in manifest_list.entries() {
+        let manifest = table.manifest_reader().read(entry).await?;
+        for entry in manifest.entries() {
+            file_count += 1;
+            row_count += entry.data_file().record_count();
+            partitions.insert(entry.data_file().partition().clone());
+        }
+    }
+    assert_eq!(file_count, 5);
+    assert_eq!(row_count, 6);
+    let partition = |category: &str, float: Option<f32>, double: Option<f64>| {
+        Struct::from_iter([
+            Some(Literal::string(category)),
+            float.map(Literal::float),
+            double.map(Literal::double),
+        ])
+    };
+    assert_eq!(
+        partitions,
+        HashSet::from([
+            partition("electronics", Some(123.456), Some(123.456)),
+            partition("books", Some(f32::NAN), Some(f64::NAN)),
+            partition("books", Some(f32::INFINITY), Some(f64::INFINITY)),
+            partition("clothing", Some(f32::NEG_INFINITY), Some(f64::NEG_INFINITY)),
+            partition("clothing", None, None),
+        ])
+    );
+
     let table_location = table.metadata().location();
     let file_io = table.file_io();
 
@@ -974,6 +891,392 @@ async fn test_insert_into_partitioned() -> Result<(), Box<dyn Error>> {
         file_io.exists(&clothing_path).await?,
         "Expected partition directory: {clothing_path}"
     );
+
+    Ok(())
+}
+
+/// Executes `plan`, which must have a single partition, and returns its rows.
+async fn run_batches(
+    plan: &dyn ExecutionPlan,
+    ctx: &SessionContext,
+) -> Result<Vec<RecordBatch>, Box<dyn Error>> {
+    assert_eq!(plan.properties().partitioning.partition_count(), 1);
+    let stream = plan.execute(0, ctx.task_ctx())?;
+    Ok(collect(stream).await?)
+}
+
+/// Executes `plan`, which must have a single partition, and renders its rows
+/// as a table.
+async fn run(
+    plan: &dyn ExecutionPlan,
+    ctx: &SessionContext,
+) -> Result<String, Box<dyn Error>> {
+    Ok(pretty_format_batches(&run_batches(plan, ctx).await?)?.to_string())
+}
+
+/// Rebuilds `scan` from its accessors alone, as a codec would.
+fn rebuild_scan(scan: &IcebergDataSource) -> IcebergDataSource {
+    IcebergDataSource::builder(scan.table().clone(), scan.schema())
+        .with_snapshot_id(scan.snapshot_id())
+        .with_predicate(scan.predicate().cloned())
+        .with_fetch(scan.fetch())
+        .build()
+        .unwrap()
+}
+
+async fn run_source(
+    source: &IcebergDataSource,
+    ctx: &SessionContext,
+) -> Result<String, Box<dyn Error>> {
+    let exec = DataSourceExec::from_data_source(source.clone());
+    run(exec.as_ref(), ctx).await
+}
+
+/// Returns the first node of type `T` in `plan`, depth first.
+fn find_node<T: ExecutionPlan + 'static>(plan: &Arc<dyn ExecutionPlan>) -> Option<&T> {
+    plan.downcast_ref::<T>()
+        .or_else(|| plan.children().into_iter().find_map(find_node::<T>))
+}
+
+/// The plan nodes and providers can be named and inspected from outside this
+/// crate, and rebuilt from their parts, as a codec that serializes them does.
+#[tokio::test]
+async fn test_plan_nodes_are_inspectable() -> Result<(), Box<dyn Error>> {
+    let iceberg_catalog = get_iceberg_catalog().await;
+    let namespace = NamespaceIdent::new("test_plan_nodes".to_string());
+    set_test_namespace(&iceberg_catalog, &namespace).await?;
+    let creation = get_table_creation(temp_path(), "my_table", None)?;
+    iceberg_catalog.create_table(&namespace, creation).await?;
+    let ident = TableIdent::new(namespace.clone(), "my_table".to_string());
+    let client: Arc<dyn Catalog> = Arc::new(iceberg_catalog);
+
+    let ctx = SessionContext::new();
+    let catalog = IcebergCatalogProvider::try_new(client.clone()).await?;
+    ctx.register_catalog("catalog", Arc::new(catalog));
+    let provider = ctx
+        .table_provider("catalog.test_plan_nodes.my_table")
+        .await?;
+    let provider = provider
+        .downcast_ref::<IcebergCatalogTableProvider>()
+        .expect("a catalog-backed provider");
+    assert_eq!(provider.table_ident(), &ident);
+    assert!(Arc::ptr_eq(provider.catalog(), &client));
+    let rebuilt = IcebergCatalogTableProvider::try_new(
+        provider.catalog().clone(),
+        provider.table_ident().namespace().clone(),
+        provider.table_ident().name(),
+    )
+    .await?;
+    assert_eq!(rebuilt.table_ident(), &ident);
+    assert_eq!(rebuilt.schema(), provider.schema());
+
+    // Write path: a commit above a write, both holding the table, and the
+    // commit going through the provider's catalog. The plan that runs is
+    // rebuilt from their accessors and children alone. The optimizer drops
+    // the coalesce above a single-partition write, so the rebuilt commit
+    // always gets one, as a codec would.
+    let insert = ctx
+        .sql("INSERT INTO catalog.test_plan_nodes.my_table VALUES (1, 'alan'), (2, 'turing')")
+        .await?
+        .create_physical_plan()
+        .await?;
+    let commit = insert
+        .downcast_ref::<IcebergCommitExec>()
+        .expect("the insert plan is rooted at a commit");
+    assert_eq!(commit.table().identifier(), &ident);
+    assert!(Arc::ptr_eq(commit.catalog(), &client));
+    let write = find_node::<IcebergWriteExec>(&insert).expect("a write below the commit");
+    assert_eq!(write.table().identifier(), &ident);
+    let rebuilt_write: Arc<dyn ExecutionPlan> = Arc::new(IcebergWriteExec::new(
+        write.table().clone(),
+        write.children()[0].clone(),
+    ));
+    let rebuilt_commit = IcebergCommitExec::new(
+        commit.table().clone(),
+        commit.catalog().clone(),
+        Arc::new(CoalescePartitionsExec::new(rebuilt_write)),
+    );
+    insta::assert_snapshot!(&run(&rebuilt_commit, &ctx).await?, @r#"
+        +-------+
+        | count |
+        +-------+
+        | 2     |
+        +-------+"#);
+
+    // Read path: a scan pinned to a snapshot, rebuilt from its accessors,
+    // returns the same rows.
+    let table = client.load_table(&ident).await?;
+    let snapshot_id = table.metadata().current_snapshot_id().unwrap();
+    let pinned =
+        IcebergStaticTableProvider::try_new_from_table_snapshot(table, snapshot_id)
+            .await?;
+    assert_eq!(pinned.snapshot_id(), Some(snapshot_id));
+    ctx.register_table("pinned", Arc::new(pinned.clone()))?;
+    // A later write, so a scan reading the current snapshot rather than the
+    // pinned one would return its row too.
+    ctx.sql("INSERT INTO catalog.test_plan_nodes.my_table VALUES (3, 'hopper')")
+        .await?
+        .collect()
+        .await?;
+    let latest_snapshot_id = client
+        .load_table(&ident)
+        .await?
+        .metadata()
+        .current_snapshot_id()
+        .unwrap();
+    assert_ne!(latest_snapshot_id, snapshot_id);
+    let plan = ctx
+        .sql("SELECT foo2 FROM pinned WHERE foo1 = 1")
+        .await?
+        .create_physical_plan()
+        .await?;
+    let scan_exec = find_node::<DataSourceExec>(&plan).expect("a data source");
+    let scan = scan_exec
+        .data_source()
+        .downcast_ref::<IcebergDataSource>()
+        .expect("an Iceberg data source");
+    assert_eq!(
+        scan.predicate().map(ToString::to_string).as_deref(),
+        Some("foo1 = 1")
+    );
+    let rebuilt = rebuild_scan(scan);
+    assert_eq!(rebuilt.schema(), scan.schema());
+    assert_eq!(rebuilt.projection(), scan.projection());
+    let expected = run_source(scan, &ctx).await?;
+    insta::assert_snapshot!(&expected, @r#"
+        +------+------+
+        | foo1 | foo2 |
+        +------+------+
+        | 1    | alan |
+        +------+------+"#);
+    assert_eq!(run_source(&rebuilt, &ctx).await?, expected);
+
+    // Without a projection the scan reads every column by name, and its limit
+    // is kept.
+    let plan = pinned.scan(&ctx.state(), None, &[], Some(1)).await?;
+    let scan_exec = plan
+        .downcast_ref::<DataSourceExec>()
+        .expect("a data source");
+    let scan = scan_exec
+        .data_source()
+        .downcast_ref::<IcebergDataSource>()
+        .expect("an Iceberg data source");
+    assert_eq!(scan.projection(), ["foo1".to_string(), "foo2".to_string()]);
+    let rebuilt = rebuild_scan(scan);
+    assert_eq!(rebuilt.fetch(), Some(1));
+    let expected = run_source(scan, &ctx).await?;
+    insta::assert_snapshot!(&expected, @r#"
+        +------+------+
+        | foo1 | foo2 |
+        +------+------+
+        | 1    | alan |
+        +------+------+"#);
+    assert_eq!(run_source(&rebuilt, &ctx).await?, expected);
+
+    // A scan reads the columns of its schema and no others, so one built over
+    // part of the table returns only those columns, from the pinned snapshot.
+    let foo2_only = Arc::new(pinned.schema().project(&[1])?);
+    let partial = IcebergDataSource::builder(pinned.table().clone(), foo2_only)
+        .with_snapshot_id(Some(snapshot_id))
+        .build()?;
+    insta::assert_snapshot!(&run_source(&partial, &ctx).await?, @r#"
+        +--------+
+        | foo2   |
+        +--------+
+        | alan   |
+        | turing |
+        +--------+"#);
+
+    // Metadata tables: a scan rebuilt from a metadata scan's parts reads the
+    // same rows.
+    let plan = ctx
+        .sql("SELECT * FROM catalog.test_plan_nodes.\"my_table$snapshots\"")
+        .await?
+        .create_physical_plan()
+        .await?;
+    let metadata_exec =
+        find_node::<DataSourceExec>(&plan).expect("a metadata data source");
+    let metadata_scan = metadata_exec
+        .data_source()
+        .downcast_ref::<IcebergMetadataDataSource>()
+        .expect("an Iceberg metadata source");
+    let provider = metadata_scan.provider();
+    assert_eq!(provider.table().identifier(), &ident);
+    let rebuilt = IcebergMetadataDataSource::try_new(
+        IcebergMetadataTableProvider::new(
+            provider.table().clone(),
+            provider.metadata_type().clone(),
+        ),
+        None,
+    )?;
+    let batches = run_batches(metadata_exec, &ctx).await?;
+    // Snapshots come back in no set order, so put the first, which has no
+    // parent, first. Their ids, times and paths differ on every run, so each
+    // row is checked against its snapshot's metadata.
+    let batch = concat_batches(&batches[0].schema(), &batches)?;
+    let order = sort_to_indices(batch.column_by_name("parent_id").unwrap(), None, None)?;
+    let batch = take_record_batch(&batch, &order)?;
+    let column = |name: &str| batch.column_by_name(name).unwrap().clone();
+    let longs = |name: &str| -> Result<Vec<Option<i64>>, Box<dyn Error>> {
+        Ok(cast(&column(name), &DataType::Int64)?
+            .as_primitive::<Int64Type>()
+            .iter()
+            .collect())
+    };
+    let strings = |name: &str| -> Vec<Option<String>> {
+        column(name)
+            .as_string::<i32>()
+            .iter()
+            .map(|value| value.map(str::to_string))
+            .collect()
+    };
+    let metadata = provider.table().metadata();
+    let snapshots = [snapshot_id, latest_snapshot_id].map(|id| {
+        metadata
+            .snapshot_by_id(id)
+            .expect("a snapshot of the table")
+    });
+    assert_eq!(
+        batch
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| field.name().as_str())
+            .collect::<Vec<_>>(),
+        [
+            "committed_at",
+            "snapshot_id",
+            "parent_id",
+            "operation",
+            "manifest_list",
+            "summary"
+        ]
+    );
+    assert_eq!(
+        longs("committed_at")?,
+        snapshots.map(|snapshot| Some(snapshot.timestamp_ms() * 1000))
+    );
+    assert_eq!(
+        longs("snapshot_id")?,
+        [Some(snapshot_id), Some(latest_snapshot_id)]
+    );
+    assert_eq!(longs("parent_id")?, [None, Some(snapshot_id)]);
+    assert_eq!(
+        strings("operation"),
+        [Some("append".to_string()), Some("append".to_string())]
+    );
+    assert_eq!(
+        strings("manifest_list"),
+        snapshots.map(|snapshot| Some(snapshot.manifest_list().to_string()))
+    );
+    // The summaries print their keys in no set order, so sort them.
+    let summaries = column("summary");
+    let summaries = summaries.as_map();
+    let summaries = (0..summaries.len())
+        .map(|row| {
+            let entries = summaries.value(row);
+            let keys = entries.column(0).as_string::<i32>();
+            let values = entries.column(1).as_string::<i32>();
+            (0..entries.len())
+                .map(|entry| format!("{}: {}", keys.value(entry), values.value(entry)))
+                .collect::<BTreeSet<_>>()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        summaries,
+        snapshots.map(|snapshot| {
+            snapshot
+                .summary()
+                .additional_properties
+                .iter()
+                .map(|(key, value)| format!("{key}: {value}"))
+                .collect::<BTreeSet<_>>()
+        })
+    );
+    // The rebuilt scan holds the same table, so lists its snapshots in the
+    // same order.
+    let rebuilt_exec = DataSourceExec::from_data_source(rebuilt);
+    assert_eq!(
+        pretty_format_batches(&run_batches(rebuilt_exec.as_ref(), &ctx).await?)?
+            .to_string(),
+        pretty_format_batches(&batches)?.to_string()
+    );
+
+    Ok(())
+}
+
+/// A catalog-backed provider keeps the schema it was built with, but scans the
+/// table as it is now. After a column is added to the table and written to, a
+/// scan with no projection still returns only the provider's columns, matching
+/// its schema.
+#[tokio::test]
+async fn test_scan_after_schema_evolution_reads_provider_columns()
+-> Result<(), Box<dyn Error>> {
+    let iceberg_catalog = get_iceberg_catalog().await;
+    let namespace = NamespaceIdent::new("test_schema_evolution".to_string());
+    set_test_namespace(&iceberg_catalog, &namespace).await?;
+    let creation = get_table_creation(temp_path(), "my_table", None)?;
+    iceberg_catalog.create_table(&namespace, creation).await?;
+    let ident = TableIdent::new(namespace.clone(), "my_table".to_string());
+    let client: Arc<dyn Catalog> = Arc::new(iceberg_catalog);
+
+    let provider = Arc::new(
+        IcebergCatalogTableProvider::try_new(client.clone(), namespace, "my_table")
+            .await?,
+    );
+    let ctx = SessionContext::new();
+    ctx.register_table("t", provider.clone())?;
+    ctx.sql("INSERT INTO t VALUES (1, 'alan')")
+        .await?
+        .collect()
+        .await?;
+
+    let table = client.load_table(&ident).await?;
+    let tx = Transaction::new(&table);
+    tx.update_schema()
+        .add_column(AddColumn::optional(
+            "foo3",
+            Type::Primitive(PrimitiveType::Int),
+        ))
+        .apply(tx)?
+        .commit(client.as_ref())
+        .await?;
+
+    // A scan reads the schema of the snapshot it reads, so write a snapshot
+    // with the new column, through a provider that sees it.
+    let evolved = IcebergCatalogTableProvider::try_new(
+        client.clone(),
+        ident.namespace().clone(),
+        ident.name(),
+    )
+    .await?;
+    insta::assert_snapshot!(display_schema(&evolved.schema()), @r#"
+    Field { "foo1": Int32, metadata: {"PARQUET:field_id": "1"} }
+    Field { "foo2": Utf8, metadata: {"PARQUET:field_id": "2"} }
+    Field { "foo3": nullable Int32, metadata: {"PARQUET:field_id": "3"} }
+    "#);
+    ctx.register_table("evolved", Arc::new(evolved))?;
+    ctx.sql("INSERT INTO evolved VALUES (2, 'turing', 3)")
+        .await?
+        .collect()
+        .await?;
+
+    let plan = provider.scan(&ctx.state(), None, &[], None).await?;
+    assert_eq!(plan.schema(), provider.schema());
+    // The rows come from two data files, which may be read in either order.
+    // They are joined under their own schema, not the plan's, so that a column
+    // the plan does not report would show.
+    let batches = run_batches(plan.as_ref(), &ctx).await?;
+    let batch = concat_batches(&batches[0].schema(), &batches)?;
+    let order = sort_to_indices(batch.column_by_name("foo1").unwrap(), None, None)?;
+    let sorted = take_record_batch(&batch, &order)?;
+    insta::assert_snapshot!(&pretty_format_batches(&[sorted])?.to_string(), @r#"
+        +------+--------+
+        | foo1 | foo2   |
+        +------+--------+
+        | 1    | alan   |
+        | 2    | turing |
+        +------+--------+"#);
 
     Ok(())
 }
